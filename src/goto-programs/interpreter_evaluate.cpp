@@ -381,6 +381,11 @@ void interpretert::evaluate(
          || (expr.type().id()==ID_address_of))
     {
       mp_integer i=0;
+      if(!expr.has_operands())
+      {
+        dest.push_back(0);
+        return;
+      }
       if(expr.has_operands() && expr.op0().id()==ID_address_of)
       {
         evaluate(expr.op0(), dest);
@@ -1038,11 +1043,19 @@ void interpretert::evaluate(
         dest.push_back(binary2integer(s, false));
         return;
       }
+      else if (expr.type().id()==ID_floatbv)
+      {
+        const std::string s=
+          integer2binary(value, to_floatbv_type(expr.type()).get_width());
+        dest.push_back(binary2integer(s, false));
+        return;
+      }
       else if((expr.type().id()==ID_bool) || (expr.type().id()==ID_c_bool))
       {
         dest.push_back(value!=0);
         return;
       }
+      error() << "missing cast type " << expr.type().pretty() << eom;
     }
   }
   else if((expr.id()==ID_array) || (expr.id()==ID_array_of))
@@ -1053,7 +1066,7 @@ void interpretert::evaluate(
     }
     return;
   }
-  else if(expr.id()==ID_nil)
+  else if ((expr.id()==ID_nil) || (expr.id()==ID_NULL) || (expr.id()==ID_null))
   {
     dest.push_back(0);
     return;

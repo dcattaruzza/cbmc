@@ -186,13 +186,15 @@ void convert(
         json_call_return["hidden"]=jsont::json_boolean(step.hidden);
         json_call_return["thread"]=json_numbert(std::to_string(step.thread_nr));
 
-        const symbolt &symbol=ns.lookup(step.identifier);
-        json_objectt &json_function=json_call_return["function"].make_object();
-        json_function["displayName"]=
-          json_stringt(id2string(symbol.display_name()));
-        json_function["identifier"]=json_stringt(id2string(step.identifier));
-        json_function["sourceLocation"]=json(symbol.location);
-
+        if (!step.identifier.empty())
+        {
+          const symbolt &symbol=ns.lookup(step.identifier);
+          json_objectt &json_function=json_call_return["function"].make_object();
+          json_function["displayName"]=
+            json_stringt(id2string(symbol.display_name()));
+          json_function["identifier"]=json_stringt(id2string(step.identifier));
+          json_function["sourceLocation"]=json(symbol.location);
+        }
         if(!json_location.is_null())
           json_call_return["sourceLocation"]=json_location;
       }
