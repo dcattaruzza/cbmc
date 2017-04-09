@@ -22,6 +22,7 @@ SRC = goto_convert.cpp goto_convert_function_call.cpp \
       show_goto_functions_xml.cpp \
       remove_static_init_loops.cpp remove_instanceof.cpp \
       remove_const_function_pointers.cpp \
+      mm_io.cpp \
       # Empty last line
 
 INCLUDES= -I ..
