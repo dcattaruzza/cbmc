@@ -156,10 +156,7 @@ public:
     return has_prefix(s, built_in1) || has_prefix(s, built_in2);
   }
 
-  bool is_built_in() const
-  {
-    return is_built_in(id2string(get_file()));
-  }
+  bool is_built_in() const;
 
   static const source_locationt &nil()
   {
