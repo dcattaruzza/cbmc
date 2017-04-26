@@ -132,6 +132,86 @@ exprt adjust_lhs_object(
 
 /*******************************************************************\
 
+Function: set_internal_dynamic_object
+
+  Inputs:
+
+ Outputs:
+
+ Purpose: set internal field for variable assignment related to
+          dynamic_object[0-9] and dynamic_[0-9]_array.
+
+\*******************************************************************/
+
+void set_internal_dynamic_object(
+  const exprt &expr,
+  goto_trace_stept &goto_trace_step,
+  const namespacet &ns)
+{
+  if(expr.id()==ID_symbol)
+  {
+    const irep_idt &id=to_ssa_expr(expr).get_original_name();
+    const symbolt *symbol;
+    if(!ns.lookup(id, symbol))
+    {
+      bool result=symbol->type.get_bool("#dynamic");
+      if(result)
+        goto_trace_step.internal=true;
+    }
+  }
+  else
+  {
+    forall_operands(it, expr)
+      set_internal_dynamic_object(*it, goto_trace_step, ns);
+  }
+}
+
+/*******************************************************************\
+
+Function: update_internal_field
+
+  Inputs:
+
+ Outputs:
+
+ Purpose: set internal for variables assignments related to
+          dynamic_object and CPROVER internal functions
+          (e.g., __CPROVER_initialize)
+
+\*******************************************************************/
+
+void update_internal_field(
+  const symex_target_equationt::SSA_stept &SSA_step,
+  goto_trace_stept &goto_trace_step,
+  const namespacet &ns)
+{
+  // set internal for dynamic_object in both lhs and rhs expressions
+  set_internal_dynamic_object(SSA_step.ssa_lhs, goto_trace_step, ns);
+  set_internal_dynamic_object(SSA_step.ssa_rhs, goto_trace_step, ns);
+
+  // set internal field to CPROVER functions (e.g., __CPROVER_initialize)
+  if(SSA_step.is_function_call())
+  {
+    if(SSA_step.source.pc->source_location.as_string().empty())
+      goto_trace_step.internal=true;
+  }
+
+  // set internal field to input and output steps
+  if(goto_trace_step.type==goto_trace_stept::OUTPUT ||
+      goto_trace_step.type==goto_trace_stept::INPUT)
+  {
+    goto_trace_step.internal=true;
+  }
+
+  // set internal field to _start function-return step
+  if(SSA_step.source.pc->function==goto_functionst::entry_point())
+  {
+    goto_trace_step.internal=true;
+  }
+}
+
+/*******************************************************************\
+
 Function: build_goto_trace
 
   Inputs:
@@ -158,11 +238,17 @@ void build_goto_trace(
 
   mp_integer current_time=0;
 
+  const goto_trace_stept *end_ptr=nullptr;
+  bool end_step_seen=false;
+
   for(symex_target_equationt::SSA_stepst::const_iterator
       it=target.SSA_steps.begin();
-      it!=end_step;
+      it!=target.SSA_steps.end();
       it++)
   {
+    if(it==end_step)
+      end_step_seen=true;
+
     const symex_target_equationt::SSA_stept &SSA_step=*it;
 
     if(prop_conv.l_get(SSA_step.guard_literal)!=tvt(true))
@@ -221,6 +307,8 @@ void build_goto_trace(
     goto_tracet::stepst &steps=time_map[current_time];
     steps.push_back(goto_trace_stept());
     goto_trace_stept &goto_trace_step=steps.back();
+    if(!end_step_seen)
+      end_ptr=&goto_trace_step;
 
     goto_trace_step.thread_nr=SSA_step.source.thread_nr;
     goto_trace_step.pc=SSA_step.source.pc;
@@ -236,6 +324,9 @@ void build_goto_trace(
     goto_trace_step.io_id=SSA_step.io_id;
     goto_trace_step.formatted=SSA_step.formatted;
     goto_trace_step.identifier=SSA_step.identifier;
+
+    // update internal field for specific variables in the counterexample
+    update_internal_field(SSA_step, goto_trace_step, ns);
 
     goto_trace_step.assignment_type=
       (it->is_assignment()&&
@@ -286,6 +377,17 @@ void build_goto_trace(
   for(auto &t_it : time_map)
     goto_trace.steps.splice(goto_trace.steps.end(), t_it.second);
 
+  // cut off the trace at the desired end
+  for(goto_tracet::stepst::iterator
+      s_it1=goto_trace.steps.begin();
+      s_it1!=goto_trace.steps.end();
+      ++s_it1)
+    if(end_step_seen && end_ptr==&(*s_it1))
+    {
+      goto_trace.trim_after(s_it1);
+      break;
+    }
+
   // produce the step numbers
   unsigned step_nr=0;
 
@@ -321,7 +423,7 @@ void build_goto_trace(
       s_it1++)
     if(s_it1->is_assert() && !s_it1->cond_value)
     {
-      goto_trace.steps.erase(++s_it1, goto_trace.steps.end());
+      goto_trace.trim_after(s_it1);
       break;
     }
 }

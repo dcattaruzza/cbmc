@@ -32,7 +32,9 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <goto-programs/remove_complex.h>
 #include <goto-programs/remove_vector.h>
 #include <goto-programs/remove_virtual_functions.h>
+#include <goto-programs/remove_exceptions.h>
 #include <goto-programs/remove_instanceof.h>
+#include <goto-programs/remove_unused_functions.h>
 
 #include <goto-symex/rewrite_union.h>
 #include <goto-symex/adjust_float_expressions.h>
@@ -177,7 +179,7 @@ int symex_parse_optionst::doit()
 
   goto_model.set_message_handler(get_message_handler());
 
-  if(goto_model(cmdline.args))
+  if(goto_model(cmdline))
     return 6;
 
   if(process_goto_program(options))
@@ -353,7 +355,6 @@ bool symex_parse_optionst::process_goto_program(const optionst &options)
   try
   {
     // we add the library
-    status() << "Adding CPROVER library" << eom;
     link_to_library(goto_model, ui_message_handler);
 
     // do partial inlining
@@ -369,6 +370,8 @@ bool symex_parse_optionst::process_goto_program(const optionst &options)
     remove_vector(goto_model);
     // Java virtual functions -> explicit dispatch tables:
     remove_virtual_functions(goto_model);
+    // Java throw and catch -> explicit exceptional return variables:
+    remove_exceptions(goto_model);
     // Java instanceof -> clsid comparison:
     remove_instanceof(goto_model);
     rewrite_union(goto_model);
@@ -379,6 +382,13 @@ bool symex_parse_optionst::process_goto_program(const optionst &options)
 
     // add loop ids
     goto_model.goto_functions.compute_loop_numbers();
+
+    if(cmdline.isset("drop-unused-functions"))
+    {
+      // Entry point will have been set before and function pointers removed
+      status() << "Removing unused functions" << eom;
+      remove_unused_functions(goto_model.goto_functions, ui_message_handler);
+    }
 
     if(cmdline.isset("cover"))
     {
@@ -694,6 +704,7 @@ void symex_parse_optionst::help()
     " --show-parse-tree            show parse tree\n"
     " --show-symbol-table          show symbol table\n"
     HELP_SHOW_GOTO_FUNCTIONS
+    " --drop-unused-functions      drop functions trivially unreachable from main function\n" // NOLINT(*)
     " --ppc-macos                  set MACOS/PPC architecture\n"
     " --mm model                   set memory model (default: sc)\n"
     " --arch                       set architecture (default: "
@@ -727,5 +738,6 @@ void symex_parse_optionst::help()
     "Other options:\n"
     " --version                    show version and exit\n"
     " --xml-ui                     use XML-formatted output\n"
+    " --verbosity #                verbosity level\n"
     "\n";
 }

@@ -20,10 +20,12 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <ansi-c/c_preprocess.h>
 
 #include <goto-programs/goto_convert_functions.h>
+#include <goto-programs/string_refine_preprocess.h>
 #include <goto-programs/remove_function_pointers.h>
 #include <goto-programs/remove_virtual_functions.h>
 #include <goto-programs/remove_instanceof.h>
 #include <goto-programs/remove_returns.h>
+#include <goto-programs/remove_exceptions.h>
 #include <goto-programs/remove_vector.h>
 #include <goto-programs/remove_complex.h>
 #include <goto-programs/remove_asm.h>
@@ -39,6 +41,8 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <goto-programs/link_to_library.h>
 #include <goto-programs/remove_skip.h>
 #include <goto-programs/show_goto_functions.h>
+#include <goto-programs/replace_java_nondet.h>
+#include <goto-programs/convert_nondet.h>
 
 #include <goto-symex/rewrite_union.h>
 #include <goto-symex/adjust_float_expressions.h>
@@ -50,6 +54,8 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <pointer-analysis/add_failed_symbols.h>
 
 #include <langapi/mode.h>
+
+#include "java_bytecode/java_bytecode_language.h"
 
 #include "cbmc_solvers.h"
 #include "cbmc_parse_options.h"
@@ -309,6 +315,16 @@ void cbmc_parse_optionst::get_command_line_options(optionst &options)
     options.set_option("refine-arithmetic", true);
   }
 
+  if(cmdline.isset("refine-strings"))
+  {
+    options.set_option("refine-strings", true);
+    options.set_option("string-non-empty", cmdline.isset("string-non-empty"));
+    options.set_option("string-printable", cmdline.isset("string-printable"));
+    if(cmdline.isset("string-max-length"))
+      options.set_option(
+        "string-max-length", cmdline.get_value("string-max-length"));
+  }
+
   if(cmdline.isset("max-node-refinement"))
     options.set_option(
       "max-node-refinement",
@@ -535,19 +551,6 @@ int cbmc_parse_optionst::doit()
      cmdline.isset("show-properties")) // use this one
   {
     const namespacet ns(symbol_table);
-    show_properties(ns, get_ui(), goto_functions);
-    return 0; // should contemplate EX_OK from sysexits.h
-  }
-
-  // may replace --show-properties
-  if(cmdline.isset("show-reachable-properties"))
-  {
-    const namespacet ns(symbol_table);
-
-    // Entry point will have been set before and function pointers removed
-    status() << "Removing Unused Functions" << eom;
-    remove_unused_functions(goto_functions, ui_message_handler);
-
     show_properties(ns, get_ui(), goto_functions);
     return 0; // should contemplate EX_OK from sysexits.h
   }
@@ -878,8 +881,6 @@ bool cbmc_parse_optionst::process_goto_program(
     remove_asm(symbol_table, goto_functions);
 
     // add the library
-    status() << "Adding CPROVER library ("
-             << config.ansi_c.arch << ")" << eom;
     link_to_library(symbol_table, goto_functions, ui_message_handler);
 
     if(cmdline.isset("string-abstraction"))
@@ -889,13 +890,52 @@ bool cbmc_parse_optionst::process_goto_program(
     // remove function pointers
     status() << "Removal of function pointers and virtual functions" << eom;
     remove_function_pointers(
+      get_message_handler(),
       symbol_table,
       goto_functions,
       cmdline.isset("pointer-check"));
     // Java virtual functions -> explicit dispatch tables:
     remove_virtual_functions(symbol_table, goto_functions);
-    // Java instanceof -> clsid comparison:
+    // remove catch and throw
+    remove_exceptions(symbol_table, goto_functions);
+    // Similar removal of RTTI inspection:
     remove_instanceof(symbol_table, goto_functions);
+
+    // do partial inlining
+    status() << "Partial Inlining" << eom;
+    goto_partial_inline(goto_functions, ns, ui_message_handler);
+
+
+    if(cmdline.isset("refine-strings"))
+    {
+      status() << "Preprocessing for string refinement" << eom;
+      string_refine_preprocesst(
+        symbol_table, goto_functions, ui_message_handler);
+    }
+
+    // remove returns, gcc vectors, complex
+    remove_returns(symbol_table, goto_functions);
+    remove_vector(symbol_table, goto_functions);
+    remove_complex(symbol_table, goto_functions);
+    rewrite_union(goto_functions, ns);
+
+    // Similar removal of java nondet statements:
+    // TODO Should really get this from java_bytecode_language somehow, but we
+    // don't have an instance of that here.
+    const auto max_nondet_array_length=
+      cmdline.isset("java-max-input-array-length")
+        ? std::stoi(cmdline.get_value("java-max-input-array-length"))
+        : MAX_NONDET_ARRAY_LENGTH_DEFAULT;
+    replace_java_nondet(goto_functions);
+    convert_nondet(
+      goto_functions,
+      symbol_table,
+      ui_message_handler,
+      max_nondet_array_length);
+
+    // add generic checks
+    status() << "Generic Property Instrumentation" << eom;
+    goto_check(ns, options, goto_functions);
 
     // full slice?
     if(cmdline.isset("full-slice"))
@@ -904,19 +944,6 @@ bool cbmc_parse_optionst::process_goto_program(
       full_slicer(goto_functions, ns);
     }
 
-    // do partial inlining
-    status() << "Partial Inlining" << eom;
-    goto_partial_inline(goto_functions, ns, ui_message_handler);
-
-    // remove returns, gcc vectors, complex
-    remove_returns(symbol_table, goto_functions);
-    remove_vector(symbol_table, goto_functions);
-    remove_complex(symbol_table, goto_functions);
-    rewrite_union(goto_functions, ns);
-
-    // add generic checks
-    status() << "Generic Property Instrumentation" << eom;
-    goto_check(ns, options, goto_functions);
     // checks don't know about adjusted float expressions
     adjust_float_expressions(goto_functions, ns);
 
@@ -948,50 +975,22 @@ bool cbmc_parse_optionst::process_goto_program(
     // add loop ids
     goto_functions.compute_loop_numbers();
 
-    // instrument cover goals
+    if(cmdline.isset("drop-unused-functions"))
+    {
+      // Entry point will have been set before and function pointers removed
+      status() << "Removing unused functions" << eom;
+      remove_unused_functions(goto_functions, ui_message_handler);
+    }
 
+    // instrument cover goals
     if(cmdline.isset("cover"))
     {
-      std::list<std::string> criteria_strings=
-        cmdline.get_values("cover");
-
-      std::set<coverage_criteriont> criteria;
-
-      for(const auto &criterion_string : criteria_strings)
-      {
-        coverage_criteriont c;
-
-        if(criterion_string=="assertion" || criterion_string=="assertions")
-          c=coverage_criteriont::ASSERTION;
-        else if(criterion_string=="path" || criterion_string=="paths")
-          c=coverage_criteriont::PATH;
-        else if(criterion_string=="branch" || criterion_string=="branches")
-          c=coverage_criteriont::BRANCH;
-        else if(criterion_string=="location" || criterion_string=="locations")
-          c=coverage_criteriont::LOCATION;
-        else if(criterion_string=="decision" || criterion_string=="decisions")
-          c=coverage_criteriont::DECISION;
-        else if(criterion_string=="condition" || criterion_string=="conditions")
-          c=coverage_criteriont::CONDITION;
-        else if(criterion_string=="mcdc")
-          c=coverage_criteriont::MCDC;
-        else if(criterion_string=="cover")
-          c=coverage_criteriont::COVER;
-        else
-        {
-          error() << "unknown coverage criterion" << eom;
-          return true;
-        }
-
-        criteria.insert(c);
-      }
-
-      status() << "Instrumenting coverage goals" << eom;
-
-      for(const auto &criterion : criteria)
-        instrument_cover_goals(symbol_table, goto_functions, criterion);
-
-      goto_functions.update();
+      if(instrument_cover_goals(
+           cmdline,
+           symbol_table,
+           goto_functions,
+           get_message_handler()))
+        return true;
     }
 
     // remove skips
@@ -1043,17 +1042,28 @@ int cbmc_parse_optionst::do_bmc(
 {
   bmc.set_ui(get_ui());
 
+  int result=6;
+
   // do actual BMC
-  bool result=(bmc.run(goto_functions)==safety_checkert::SAFE);
+  switch(bmc.run(goto_functions))
+  {
+    case safety_checkert::SAFE:
+      result=0;
+      break;
+    case safety_checkert::UNSAFE:
+      result=10;
+      break;
+    case safety_checkert::ERROR:
+      result=6;
+      break;
+  }
 
   // let's log some more statistics
   debug() << "Memory consumption:" << messaget::endl;
   memory_info(debug());
   debug() << eom;
 
-  // We return '0' if the property holds,
-  // and '10' if it is violated.
-  return result?0:10;
+  return result;
 }
 
 /*******************************************************************\
@@ -1140,6 +1150,7 @@ void cbmc_parse_optionst::help()
     " --show-parse-tree            show parse tree\n"
     " --show-symbol-table          show symbol table\n"
     HELP_SHOW_GOTO_FUNCTIONS
+    " --drop-unused-functions      drop functions trivially unreachable from main function\n" // NOLINT(*)
     "\n"
     "Program instrumentation options:\n"
     HELP_GOTO_CHECK
@@ -1155,6 +1166,7 @@ void cbmc_parse_optionst::help()
     // NOLINTNEXTLINE(whitespace/line_length)
     " --java-max-vla-length        limit the length of user-code-created arrays\n"
     // NOLINTNEXTLINE(whitespace/line_length)
+    " --java-cp-include-files      regexp or JSON list of files to load (with '@' prefix)\n"
     " --java-unwind-enum-static    try to unwind loops in static initialization of enums\n"
     "\n"
     "Semantic transformations:\n"
@@ -1186,6 +1198,10 @@ void cbmc_parse_optionst::help()
     " --yices                      use Yices\n"
     " --z3                         use Z3\n"
     " --refine                     use refinement procedure (experimental)\n"
+    " --refine-strings             use string refinement (experimental)\n"
+    " --string-non-empty           add constraint that strings are non empty (experimental)\n" // NOLINT(*)
+    " --string-printable           add constraint that strings are printable (experimental)\n" // NOLINT(*)
+    " --string-max-length          add constraint on the length of strings (experimental)\n" // NOLINT(*)
     " --outfile filename           output formula to given file\n"
     " --arrays-uf-never            never turn arrays into uninterpreted functions\n" // NOLINT(*)
     " --arrays-uf-always           always turn arrays into uninterpreted functions\n" // NOLINT(*)
@@ -1195,5 +1211,6 @@ void cbmc_parse_optionst::help()
     " --xml-ui                     use XML-formatted output\n"
     " --xml-interface              bi-directional XML interface\n"
     " --json-ui                    use JSON-formatted output\n"
+    " --verbosity #                verbosity level\n"
     "\n";
 }

@@ -75,6 +75,8 @@ public:
     file_map.clear();
   }
 
+  void set_should_generate_opaque_method_stubs(bool stubs_enabled);
+
   bool parse();
 
   void show_parse(std::ostream &out);
@@ -87,7 +89,7 @@ public:
 
   bool has_lazy_method(const irep_idt &id)
   {
-    return lazy_method_map.count(id);
+    return lazy_method_map.count(id)!=0;
   }
 
   // The method must have been added to the symbol table and registered

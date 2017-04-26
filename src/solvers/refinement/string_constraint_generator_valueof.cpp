@@ -63,7 +63,8 @@ Function: string_constraint_generatort::add_axioms_from_float
 string_exprt string_constraint_generatort::add_axioms_from_float(
   const function_application_exprt &f)
 {
-  return add_axioms_from_float(args(f, 1)[0], false);
+  const refined_string_typet &ref_type=to_refined_string_type(f.type());
+  return add_axioms_from_float(args(f, 1)[0], ref_type, false);
 }
 
 /*******************************************************************\
@@ -81,7 +82,8 @@ Function: string_constraint_generatort::add_axioms_from_double
 string_exprt string_constraint_generatort::add_axioms_from_double(
   const function_application_exprt &f)
 {
-  return add_axioms_from_float(args(f, 1)[0], true);
+  const refined_string_typet &ref_type=to_refined_string_type(f.type());
+  return add_axioms_from_float(args(f, 1)[0], ref_type, true);
 }
 
 /*******************************************************************\
@@ -99,13 +101,12 @@ Function: string_constraint_generatort::add_axioms_from_float
 \*******************************************************************/
 
 string_exprt string_constraint_generatort::add_axioms_from_float(
-  const exprt &f, bool double_precision)
+  const exprt &f, const refined_string_typet &ref_type, bool double_precision)
 {
-  const refined_string_typet &ref_type=to_refined_string_type(f.type());
+  string_exprt res=fresh_string(ref_type);
   const typet &index_type=ref_type.get_index_type();
   const typet &char_type=ref_type.get_char_type();
-  string_exprt res=fresh_string(ref_type);
-  const exprt &index24=from_integer(24, ref_type.get_index_type());
+  const exprt &index24=from_integer(24, index_type);
   axioms.push_back(res.axiom_for_is_shorter_than(index24));
 
   string_exprt magnitude=fresh_string(ref_type);
@@ -227,14 +228,11 @@ string_exprt string_constraint_generatort::add_axioms_from_bool(
   const exprt &b, const refined_string_typet &ref_type)
 {
   string_exprt res=fresh_string(ref_type);
-  const typet &index_type=ref_type.get_index_type();
+  const typet &char_type=ref_type.get_char_type();
 
   assert(b.type()==bool_typet() || b.type().id()==ID_c_bool);
 
   typecast_exprt eq(b, bool_typet());
-
-  string_exprt true_string=add_axioms_for_constant("true", ref_type);
-  string_exprt false_string=add_axioms_for_constant("false", ref_type);
 
   // We add axioms:
   // a1 : eq => res = |"true"|
@@ -242,27 +240,27 @@ string_exprt string_constraint_generatort::add_axioms_from_bool(
   // a3 : !eq => res = |"false"|
   // a4 : forall i < |"false"|. !eq => res[i]="false"[i]
 
-  implies_exprt a1(eq, res.axiom_for_has_same_length_as(true_string));
+  std::string str_true="true";
+  implies_exprt a1(eq, res.axiom_for_has_length(str_true.length()));
   axioms.push_back(a1);
-  symbol_exprt qvar=fresh_univ_index("QA_equal_true", index_type);
-  string_constraintt a2(
-    qvar,
-    true_string.length(),
-    eq,
-    equal_exprt(res[qvar], true_string[qvar]));
-  axioms.push_back(a2);
 
-  implies_exprt a3(
-    not_exprt(eq), res.axiom_for_has_same_length_as(false_string));
+  for(std::size_t i=0; i<str_true.length(); i++)
+  {
+    exprt chr=from_integer(str_true[i], char_type);
+    implies_exprt a2(eq, equal_exprt(res[i], chr));
+    axioms.push_back(a2);
+  }
+
+  std::string str_false="false";
+  implies_exprt a3(not_exprt(eq), res.axiom_for_has_length(str_false.length()));
   axioms.push_back(a3);
 
-  symbol_exprt qvar1=fresh_univ_index("QA_equal_false", index_type);
-  string_constraintt a4(
-    qvar,
-    false_string.length(),
-    not_exprt(eq),
-    equal_exprt(res[qvar1], false_string[qvar1]));
-  axioms.push_back(a4);
+  for(std::size_t i=0; i<str_false.length(); i++)
+  {
+    exprt chr=from_integer(str_false[i], char_type);
+    implies_exprt a4(not_exprt(eq), equal_exprt(res[i], chr));
+    axioms.push_back(a4);
+  }
 
   return res;
 }
@@ -323,12 +321,21 @@ string_exprt string_constraint_generatort::add_axioms_from_int(
   axioms.push_back(a1);
 
   exprt chr=res[0];
-  exprt starts_with_minus=equal_exprt(chr, minus_char);
-  exprt starts_with_digit=and_exprt(
+  equal_exprt starts_with_minus(chr, minus_char);
+  and_exprt starts_with_digit(
     binary_relation_exprt(chr, ID_ge, zero_char),
     binary_relation_exprt(chr, ID_le, nine_char));
   or_exprt a2(starts_with_digit, starts_with_minus);
   axioms.push_back(a2);
+
+  // These are constraints to detect number that requiere the maximum number
+  // of digits
+  exprt smallest_with_max_digits=
+    from_integer(smallest_by_digit(max_size-1), type);
+  binary_relation_exprt big_negative(
+    i, ID_le, unary_minus_exprt(smallest_with_max_digits));
+  binary_relation_exprt big_positive(i, ID_ge, smallest_with_max_digits);
+  or_exprt requieres_max_digits(big_negative, big_positive);
 
   for(size_t size=1; size<=max_size; size++)
   {
@@ -387,13 +394,18 @@ string_exprt string_constraint_generatort::add_axioms_from_int(
       axioms.push_back(a6);
     }
 
-    // we have to be careful when exceeding the maximal size of integers
+    // when the size is close to the maximum, either the number is very big
+    // or it is negative
+    if(size==max_size-1)
+    {
+      implies_exprt a7(premise, or_exprt(requieres_max_digits,
+                                         starts_with_minus));
+      axioms.push_back(a7);
+    }
+    // when we reach the maximal size the number is very big in the negative
     if(size==max_size)
     {
-      exprt smallest_with_10_digits=from_integer(
-        smallest_by_digit(max_size), type);
-      binary_relation_exprt big(i, ID_ge, smallest_with_10_digits);
-      implies_exprt a7(premise, big);
+      implies_exprt a7(premise, and_exprt(starts_with_minus, big_negative));
       axioms.push_back(a7);
     }
   }
@@ -597,6 +609,70 @@ string_exprt string_constraint_generatort::add_axioms_for_value_of(
 
 /*******************************************************************\
 
+Function: string_constraint_generatort::add_axioms_for_correct_number_format
+
+  Inputs: function application with one string expression
+
+ Outputs: an boolean expression
+
+ Purpose: add axioms making the return value true if the given string is
+          a correct number
+
+\*******************************************************************/
+
+exprt string_constraint_generatort::add_axioms_for_correct_number_format(
+  const string_exprt &str, std::size_t max_size)
+{
+  symbol_exprt correct=fresh_boolean("correct_number_format");
+  const refined_string_typet &ref_type=to_refined_string_type(str.type());
+  const typet &char_type=ref_type.get_char_type();
+  const typet &index_type=ref_type.get_index_type();
+  exprt zero_char=constant_char('0', char_type);
+  exprt nine_char=constant_char('9', char_type);
+  exprt minus_char=constant_char('-', char_type);
+  exprt plus_char=constant_char('+', char_type);
+
+  exprt chr=str[0];
+  equal_exprt starts_with_minus(chr, minus_char);
+  equal_exprt starts_with_plus(chr, plus_char);
+  and_exprt starts_with_digit(
+    binary_relation_exprt(chr, ID_ge, zero_char),
+    binary_relation_exprt(chr, ID_le, nine_char));
+
+  // TODO: we should have implications in the other direction for correct
+  // correct => |str| > 0
+  exprt non_empty=str.axiom_for_is_longer_than(from_integer(1, index_type));
+  axioms.push_back(implies_exprt(correct, non_empty));
+
+  // correct => (str[0] = '+' or '-' || '0' <= str[0] <= '9')
+  or_exprt correct_first(
+    or_exprt(starts_with_minus, starts_with_plus), starts_with_digit);
+  axioms.push_back(implies_exprt(correct, correct_first));
+
+  // correct => str[0]='+' or '-' ==> |str| > 1
+  implies_exprt contains_digit(
+    or_exprt(starts_with_minus, starts_with_plus),
+    str.axiom_for_is_longer_than(from_integer(2, index_type)));
+  axioms.push_back(implies_exprt(correct, contains_digit));
+
+  // correct => |str| < max_size
+  axioms.push_back(
+    implies_exprt(correct, str.axiom_for_is_shorter_than(max_size)));
+
+  // forall 1 <= qvar < |str| . correct => '0'<= str[qvar] <= '9'
+  symbol_exprt qvar=fresh_univ_index("number_format", index_type);
+  and_exprt is_digit(
+    binary_relation_exprt(str[qvar], ID_ge, zero_char),
+    binary_relation_exprt(str[qvar], ID_le, nine_char));
+  string_constraintt all_digits(
+    qvar, from_integer(1, index_type), str.length(), correct, is_digit);
+  axioms.push_back(all_digits);
+
+  return correct;
+}
+
+/*******************************************************************\
+
 Function: string_constraint_generatort::add_axioms_for_parse_int
 
   Inputs: function application with one string expression
@@ -610,7 +686,7 @@ Function: string_constraint_generatort::add_axioms_for_parse_int
 exprt string_constraint_generatort::add_axioms_for_parse_int(
   const function_application_exprt &f)
 {
-  string_exprt str=add_axioms_for_string_expr(args(f, 1)[0]);
+  string_exprt str=get_string_expr(args(f, 1)[0]);
   const typet &type=f.type();
   symbol_exprt i=fresh_symbol("parsed_int", type);
   const refined_string_typet &ref_type=to_refined_string_type(str.type());
@@ -626,6 +702,10 @@ exprt string_constraint_generatort::add_axioms_for_parse_int(
   exprt starts_with_plus=equal_exprt(chr, plus_char);
   exprt starts_with_digit=binary_relation_exprt(chr, ID_ge, zero_char);
 
+  // TODO: we should throw an exception when this does not hold:
+  exprt correct=add_axioms_for_correct_number_format(str);
+  axioms.push_back(correct);
+
   for(unsigned size=1; size<=10; size++)
   {
     exprt sum=from_integer(0, type);
@@ -633,10 +713,29 @@ exprt string_constraint_generatort::add_axioms_for_parse_int(
 
     for(unsigned j=1; j<size; j++)
     {
-      sum=plus_exprt(
-        mult_exprt(sum, ten),
+      mult_exprt ten_sum(sum, ten);
+      if(j>=9)
+      {
+        // We have to be careful about overflows
+        div_exprt div(sum, ten);
+        equal_exprt no_overflow(div, sum);
+        axioms.push_back(no_overflow);
+      }
+
+      sum=plus_exprt_with_overflow_check(
+        ten_sum,
         typecast_exprt(minus_exprt(str[j], zero_char), type));
-      first_value=mult_exprt(first_value, ten);
+
+      mult_exprt first(first_value, ten);
+      if(j>=9)
+      {
+        // We have to be careful about overflows
+        div_exprt div_first(first, ten);
+        implies_exprt no_overflow_first(
+          starts_with_digit, equal_exprt(div_first, first_value));
+        axioms.push_back(no_overflow_first);
+      }
+      first_value=first;
     }
 
     // If the length is `size`, we add axioms:

@@ -26,6 +26,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <ansi-c/string_constant.h>
 
 #include <goto-programs/goto_functions.h>
+#include <goto-programs/remove_exceptions.h>
 
 #include "java_entry_point.h"
 #include "java_object_factory.h"
@@ -37,7 +38,7 @@ Author: Daniel Kroening, kroening@kroening.com
 
 Function: create_initialize
 
-  Inputs:
+ Inputs:
 
  Outputs:
 
@@ -89,7 +90,7 @@ static bool should_init_symbol(const symbolt &sym)
 
 Function: java_static_lifetime_init
 
-  Inputs:
+ Inputs:
 
  Outputs:
 
@@ -141,8 +142,7 @@ bool java_static_lifetime_init(
           allow_null,
           symbol_table,
           max_nondet_array_length,
-          source_location,
-          message_handler);
+          source_location);
         code_assignt assignment(sym.symbol_expr(), newsym);
         code_block.add(assignment);
       }
@@ -155,25 +155,6 @@ bool java_static_lifetime_init(
     }
   }
 
-  // we now need to run all the <clinit> methods
-
-  for(symbol_tablet::symbolst::const_iterator
-      it=symbol_table.symbols.begin();
-      it!=symbol_table.symbols.end();
-      it++)
-  {
-    if(it->second.base_name=="<clinit>" &&
-       it->second.type.id()==ID_code &&
-       it->second.mode==ID_java)
-    {
-      code_function_callt function_call;
-      function_call.lhs()=nil_exprt();
-      function_call.function()=it->second.symbol_expr();
-      function_call.add_source_location()=source_location;
-      code_block.add(function_call);
-    }
-  }
-
   return false;
 }
 
@@ -181,7 +162,7 @@ bool java_static_lifetime_init(
 
 Function: java_build_arguments
 
-  Inputs:
+ Inputs:
 
  Outputs:
 
@@ -233,8 +214,7 @@ exprt::operandst java_build_arguments(
         allow_null,
         symbol_table,
         max_nondet_array_length,
-        function.location,
-        message_handler);
+        function.location);
 
     const symbolt &p_symbol=
       symbol_table.lookup(parameters[param_number].get_identifier());
@@ -260,7 +240,7 @@ exprt::operandst java_build_arguments(
 
 Function: java_record_outputs
 
-  Inputs:
+ Inputs:
 
  Outputs:
 
@@ -289,7 +269,8 @@ void java_record_outputs(
     codet output(ID_output);
     output.operands().resize(2);
 
-    const symbolt &return_symbol=symbol_table.lookup("return'");
+    const symbolt &return_symbol=
+      symbol_table.lookup(JAVA_ENTRY_POINT_RETURN_SYMBOL);
 
     output.op0()=
       address_of_exprt(
@@ -325,6 +306,24 @@ void java_record_outputs(
       init_code.move_to_operands(output);
     }
   }
+
+  // record exceptional return variable as output
+  codet output(ID_output);
+  output.operands().resize(2);
+
+  assert(symbol_table.has_symbol(id2string(function.name)+EXC_SUFFIX));
+
+  // retrieve the exception variable
+  const symbolt exc_symbol=symbol_table.lookup(
+    id2string(function.name)+EXC_SUFFIX);
+
+  output.op0()=address_of_exprt(
+    index_exprt(string_constantt(exc_symbol.base_name),
+                from_integer(0, index_type())));
+  output.op1()=exc_symbol.symbol_expr();
+  output.add_source_location()=function.location;
+
+  init_code.move_to_operands(output);
 }
 
 main_function_resultt get_main_symbol(
@@ -501,10 +500,13 @@ main_function_resultt get_main_symbol(
 
 Function: java_entry_point
 
-  Inputs: symbol_table
-          main class
-          message_handler
-          allow pointers in initialization code to be null
+ Inputs:
+  symbol_table
+  main class
+  message_handler
+  assume_init_pointers_not_null - allow pointers in initialization code to be
+                                  null
+  max_nondet_array_length
 
  Outputs: true if error occurred on entry point search
 
@@ -583,13 +585,22 @@ bool java_entry_point(
     auxiliary_symbolt return_symbol;
     return_symbol.mode=ID_C;
     return_symbol.is_static_lifetime=false;
-    return_symbol.name="return'";
+    return_symbol.name=JAVA_ENTRY_POINT_RETURN_SYMBOL;
     return_symbol.base_name="return";
     return_symbol.type=to_code_type(symbol.type).return_type();
 
     symbol_table.add(return_symbol);
     call_main.lhs()=return_symbol.symbol_expr();
   }
+
+  // add the exceptional return value
+  auxiliary_symbolt exc_symbol;
+  exc_symbol.mode=ID_C;
+  exc_symbol.is_static_lifetime=false;
+  exc_symbol.name=id2string(symbol.name)+EXC_SUFFIX;
+  exc_symbol.base_name=id2string(symbol.name)+EXC_SUFFIX;
+  exc_symbol.type=typet(ID_pointer, empty_typet());
+  symbol_table.add(exc_symbol);
 
   exprt::operandst main_arguments=
     java_build_arguments(

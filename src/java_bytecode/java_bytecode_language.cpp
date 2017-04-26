@@ -13,6 +13,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <util/config.h>
 #include <util/cmdline.h>
 #include <util/string2int.h>
+#include <json/json_parser.h>
 
 #include <goto-programs/class_hierarchy.h>
 
@@ -41,9 +42,8 @@ Function: java_bytecode_languaget::get_language_options
 
 void java_bytecode_languaget::get_language_options(const cmdlinet &cmd)
 {
-  disable_runtime_checks=cmd.isset("disable-runtime-check");
   assume_inputs_non_null=cmd.isset("java-assume-inputs-non-null");
-  string_refinement_enabled=cmd.isset("string-refine");
+  string_refinement_enabled=cmd.isset("refine-strings");
   if(cmd.isset("java-max-input-array-length"))
     max_nondet_array_length=
       std::stoi(cmd.get_value("java-max-input-array-length"));
@@ -55,6 +55,36 @@ void java_bytecode_languaget::get_language_options(const cmdlinet &cmd)
     lazy_methods_mode=LAZY_METHODS_MODE_CONTEXT_INSENSITIVE;
   else
     lazy_methods_mode=LAZY_METHODS_MODE_EAGER;
+
+  if(cmd.isset("java-cp-include-files"))
+  {
+    java_cp_include_files=cmd.get_value("java-cp-include-files");
+    // load file list from JSON file
+    if(java_cp_include_files[0]=='@')
+    {
+      jsont json_cp_config;
+      if(parse_json(
+           java_cp_include_files.substr(1),
+           get_message_handler(),
+           json_cp_config))
+        throw "cannot read JSON input configuration for JAR loading";
+
+      if(!json_cp_config.is_object())
+        throw "the JSON file has a wrong format";
+      jsont include_files=json_cp_config["jar"];
+      if(!include_files.is_array())
+         throw "the JSON file has a wrong format";
+
+      // add jars from JSON config file to classpath
+      for(const jsont &file_entry : include_files.array)
+      {
+        assert(file_entry.is_string() && has_suffix(file_entry.value, ".jar"));
+        config.java.classpath.push_back(file_entry.value);
+      }
+    }
+  }
+  else
+    java_cp_include_files=".*";
 }
 
 /*******************************************************************\
@@ -129,6 +159,7 @@ bool java_bytecode_languaget::parse(
   const std::string &path)
 {
   java_class_loader.set_message_handler(get_message_handler());
+  java_class_loader.set_java_cp_include_files(java_cp_include_files);
 
   // look at extension
   if(has_suffix(path, ".class"))
@@ -138,12 +169,14 @@ bool java_bytecode_languaget::parse(
   }
   else if(has_suffix(path, ".jar"))
   {
-    #ifdef HAVE_LIBZIP
+    java_class_loader_limitt class_loader_limit(
+      get_message_handler(),
+      java_cp_include_files);
     if(config.java.main_class.empty())
     {
       // Does it have a main class set in the manifest?
       jar_filet::manifestt manifest=
-        java_class_loader.jar_pool(path).get_manifest();
+        java_class_loader.jar_pool(class_loader_limit, path).get_manifest();
       std::string manifest_main_class=manifest["Main-Class"];
 
       if(manifest_main_class!="")
@@ -155,18 +188,13 @@ bool java_bytecode_languaget::parse(
     // Do we have one now?
     if(main_class.empty())
     {
-      status() << "JAR file without entry point: loading it all" << eom;
-      java_class_loader.load_entire_jar(path);
+      status() << "JAR file without entry point: loading class files" << eom;
+      java_class_loader.load_entire_jar(class_loader_limit, path);
       for(const auto &kv : java_class_loader.jar_map.at(path).entries)
         main_jar_classes.push_back(kv.first);
     }
     else
       java_class_loader.add_jar_file(path);
-
-    #else
-    error() << "No support for reading JAR files" << eom;
-    return true;
-    #endif
   }
   else
     assert(false);
@@ -361,9 +389,16 @@ static void gather_needed_globals(
 {
   if(e.id()==ID_symbol)
   {
-    const auto &sym=symbol_table.lookup(to_symbol_expr(e).get_identifier());
-    if(sym.is_static_lifetime)
-      needed.add(sym);
+    // If the symbol isn't in the symbol table at all, then it is defined
+    // on an opaque type (i.e. we don't have the class definition at this point)
+    // and will be created during the typecheck phase.
+    // We don't mark it as 'needed' as it doesn't exist yet to keep.
+    auto findit=symbol_table.symbols.find(to_symbol_expr(e).get_identifier());
+    if(findit!=symbol_table.symbols.end() &&
+       findit->second.is_static_lifetime)
+    {
+      needed.add(findit->second);
+    }
   }
   else
     forall_operands(opit, e)
@@ -492,7 +527,6 @@ bool java_bytecode_languaget::typecheck(
          c_it->second,
          symbol_table,
          get_message_handler(),
-         disable_runtime_checks,
          max_user_array_length,
          lazy_methods,
          lazy_methods_mode,
@@ -508,6 +542,20 @@ bool java_bytecode_languaget::typecheck(
     if(do_ci_lazy_method_conversion(symbol_table, lazy_methods))
       return true;
   }
+  else if(lazy_methods_mode==LAZY_METHODS_MODE_EAGER)
+  {
+    // Simply elaborate all methods symbols now.
+    for(const auto &method_sig : lazy_methods)
+    {
+      java_bytecode_convert_method(
+        *method_sig.second.first,
+        *method_sig.second.second,
+        symbol_table,
+        get_message_handler(),
+        max_user_array_length);
+    }
+  }
+  // Otherwise our caller is in charge of elaborating methods on demand.
 
   // now typecheck all
   if(java_bytecode_typecheck(
@@ -613,7 +661,6 @@ bool java_bytecode_languaget::do_ci_lazy_method_conversion(
           *parsed_method.second,
           symbol_table,
           get_message_handler(),
-          disable_runtime_checks,
           max_user_array_length,
           safe_pointer<std::vector<irep_idt> >::create_non_null(
             &method_worklist2),
@@ -728,7 +775,6 @@ void java_bytecode_languaget::convert_lazy_method(
     *lazy_method_entry.second,
     symtab,
     get_message_handler(),
-    disable_runtime_checks,
     max_user_array_length);
 }
 
@@ -750,7 +796,6 @@ bool java_bytecode_languaget::final(symbol_tablet &symbol_table)
   if(c_final(symbol_table, message_handler)) return true;
   */
   java_internal_additions(symbol_table);
-
 
   main_function_resultt res=
     get_main_symbol(symbol_table, main_class, get_message_handler());

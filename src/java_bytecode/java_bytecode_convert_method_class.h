@@ -30,13 +30,11 @@ public:
   java_bytecode_convert_methodt(
     symbol_tablet &_symbol_table,
     message_handlert &_message_handler,
-    bool _disable_runtime_checks,
     size_t _max_array_length,
     safe_pointer<std::vector<irep_idt> > _needed_methods,
     safe_pointer<std::set<irep_idt> > _needed_classes):
     messaget(_message_handler),
     symbol_table(_symbol_table),
-    disable_runtime_checks(_disable_runtime_checks),
     max_array_length(_max_array_length),
     needed_methods(_needed_methods),
     needed_classes(_needed_classes)
@@ -56,7 +54,6 @@ public:
 
 protected:
   symbol_tablet &symbol_table;
-  const bool disable_runtime_checks;
   const size_t max_array_length;
   safe_pointer<std::vector<irep_idt> > needed_methods;
   safe_pointer<std::set<irep_idt> > needed_classes;
@@ -97,6 +94,8 @@ public:
   expanding_vectort<variablest> variables;
   std::set<symbol_exprt> used_local_names;
   bool method_has_this;
+  std::map<irep_idt, bool> class_has_clinit_method;
+  std::map<irep_idt, bool> any_superclass_has_clinit_method;
 
   typedef enum instruction_sizet
   {
@@ -141,6 +140,7 @@ public:
 
   exprt::operandst pop(std::size_t n);
 
+  void pop_residue(std::size_t n);
   void push(const exprt::operandst &o);
 
   bool is_constructor(const class_typet::methodt &method);
@@ -223,6 +223,10 @@ protected:
   void check_static_field_stub(
     const symbol_exprt &se,
     const irep_idt &basename);
+
+  bool class_needs_clinit(const irep_idt &classname);
+  exprt get_or_create_clinit_wrapper(const irep_idt &classname);
+  codet get_clinit_call(const irep_idt &classname);
 };
 
 #endif

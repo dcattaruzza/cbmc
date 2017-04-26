@@ -1505,15 +1505,9 @@ public:
     op1().id(ID_unknown);
   }
 
-  exprt &instance()
-  {
-    return op0();
-  }
+  void set_instance(unsigned int instance);
 
-  const exprt &instance() const
-  {
-    return op0();
-  }
+  unsigned int get_instance() const;
 
   exprt &valid()
   {
@@ -3459,6 +3453,19 @@ public:
   function_application_exprt():exprt(ID_function_application)
   {
     operands().resize(2);
+  }
+
+  explicit function_application_exprt(const typet &_type):
+    exprt(ID_function_application, _type)
+  {
+    operands().resize(2);
+  }
+
+  function_application_exprt(
+    const symbol_exprt &_function, const typet &_type):
+      function_application_exprt(_type) // NOLINT(runtime/explicit)
+  {
+    function()=_function;
   }
 
   exprt &function()

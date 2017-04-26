@@ -32,16 +32,22 @@ class optionst;
   "(depth):(partial-loops)(no-unwinding-assertions)(unwinding-assertions)" \
   OPT_GOTO_CHECK \
   "(no-assertions)(no-assumptions)" \
+  "(no-built-in-assertions)" \
   "(xml-ui)(xml-interface)(json-ui)" \
   "(smt1)(smt2)(fpa)(cvc3)(cvc4)(boolector)(yices)(z3)(opensmt)(mathsat)" \
   "(no-sat-preprocessor)" \
   "(no-pretty-names)(beautify)" \
   "(dimacs)(refine)(max-node-refinement):(refine-arrays)(refine-arithmetic)"\
+  "(refine-strings)" \
+  "(string-non-empty)" \
+  "(string-printable)" \
+  "(string-max-length):" \
   "(aig)(16)(32)(64)(LP64)(ILP64)(LLP64)(ILP32)(LP32)" \
   "(little-endian)(big-endian)" \
   "(show-goto-functions)(show-loops)" \
   "(show-symbol-table)(show-parse-tree)(show-vcc)" \
-  "(show-claims)(claim):(show-properties)(show-reachable-properties)" \
+  "(show-claims)(claim):(show-properties)" \
+  "(drop-unused-functions)" \
   "(property):(stop-on-fail)(trace)" \
   "(error-label):(verbosity):(no-library)" \
   "(nondet-static)" \
@@ -55,6 +61,7 @@ class optionst;
   "(round-to-nearest)(round-to-plus-inf)(round-to-minus-inf)(round-to-zero)" \
   "(graphml-witness):" \
   "(java-max-vla-length):(java-unwind-enum-static)" \
+  "(java-cp-include-files):" \
   "(localize-faults)(localize-faults-method):" \
   "(lazy-methods)" \
   "(fixedbv)(floatbv)(all-claims)(all-properties)" // legacy, and will eventually disappear // NOLINT(whitespace/line_length)

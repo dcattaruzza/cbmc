@@ -5,6 +5,7 @@ Module: JAVA Bytecode Language Conversion
 Author: Daniel Kroening, kroening@kroening.com
 
 \*******************************************************************/
+
 #ifdef DEBUG
 #include <iostream>
 #endif
@@ -30,6 +31,7 @@ Author: Daniel Kroening, kroening@kroening.com
 #include <algorithm>
 #include <functional>
 #include <unordered_set>
+#include <regex>
 
 class patternt
 {
@@ -53,6 +55,56 @@ public:
 protected:
   const char *p;
 };
+
+/*******************************************************************\
+
+Function: assign_parameter_names
+
+  Inputs: `ftype`: Function type whose parameters should be named
+          `name_prefix`: Prefix for parameter names, typically the
+            parent function's name.
+          `symbol_table`: Global symbol table
+
+ Outputs: Assigns parameter names (side-effects on `ftype`) to
+          function stub parameters, which are initially nameless
+          as method conversion hasn't happened.
+          Also creates symbols in `symbol_table`.
+
+ Purpose: See above
+
+\*******************************************************************/
+
+void assign_parameter_names(
+  code_typet &ftype,
+  const irep_idt &name_prefix,
+  symbol_tablet &symbol_table)
+{
+  code_typet::parameterst &parameters=ftype.parameters();
+
+  // Mostly borrowed from java_bytecode_convert.cpp; maybe factor this out.
+  // assign names to parameters
+  for(std::size_t i=0; i<parameters.size(); ++i)
+  {
+    irep_idt base_name, identifier;
+
+    if(i==0 && parameters[i].get_this())
+      base_name="this";
+    else
+      base_name="stub_ignored_arg"+std::to_string(i);
+
+    identifier=id2string(name_prefix)+"::"+id2string(base_name);
+    parameters[i].set_base_name(base_name);
+    parameters[i].set_identifier(identifier);
+
+    // add to symbol table
+    parameter_symbolt parameter_symbol;
+    parameter_symbol.base_name=base_name;
+    parameter_symbol.mode=ID_java;
+    parameter_symbol.name=identifier;
+    parameter_symbol.type=parameters[i].type();
+    symbol_table.add(parameter_symbol);
+  }
+}
 
 static bool operator==(const irep_idt &what, const patternt &pattern)
 {
@@ -105,6 +157,25 @@ exprt::operandst java_bytecode_convert_methodt::pop(std::size_t n)
 
   stack.resize(stack.size()-n);
   return operands;
+}
+
+/*******************************************************************\
+
+Function: java_bytecode_convert_methodt::pop_residue
+
+Inputs:
+
+Outputs:
+
+Purpose: removes minimum(n, stack.size()) elements from the stack
+
+\*******************************************************************/
+
+void java_bytecode_convert_methodt::pop_residue(std::size_t n)
+{
+  std::size_t residue_size=std::min(n, stack.size());
+
+  stack.resize(stack.size()-residue_size);
 }
 
 void java_bytecode_convert_methodt::push(const exprt::operandst &o)
@@ -168,7 +239,6 @@ const exprt java_bytecode_convert_methodt::variable(
     symbol_exprt result(identifier, t);
     result.set(ID_C_base_name, base_name);
     used_local_names.insert(result);
-
     return result;
   }
   else
@@ -797,8 +867,10 @@ static void gather_symbol_live_ranges(
     }
   }
   else
+  {
     forall_operands(it, e)
       gather_symbol_live_ranges(pc, *it, result);
+  }
 }
 
 /*******************************************************************\
@@ -836,6 +908,174 @@ void java_bytecode_convert_methodt::check_static_field_stub(
     new_symbol.value.make_nil();
     symbol_table.add(new_symbol);
   }
+}
+
+/*******************************************************************\
+
+Function: java_bytecode_convert_methodt::class_needs_clinit
+
+  Inputs: classname: Class name
+
+ Outputs: Returns true if the given class or one of its parents
+          has a static initializer
+
+ Purpose: Determine whether a `new` or static access against `classname`
+          should be prefixed with a static initialization check.
+
+\*******************************************************************/
+
+bool java_bytecode_convert_methodt::class_needs_clinit(
+  const irep_idt &classname)
+{
+  auto findit_any=any_superclass_has_clinit_method.insert({classname, false});
+  if(!findit_any.second)
+    return findit_any.first->second;
+
+  auto findit_here=class_has_clinit_method.insert({classname, false});
+  if(findit_here.second)
+  {
+    const irep_idt &clinit_name=id2string(classname)+".<clinit>:()V";
+    findit_here.first->second=symbol_table.symbols.count(clinit_name);
+  }
+  if(findit_here.first->second)
+  {
+    findit_any.first->second=true;
+    return true;
+  }
+  auto findit_symbol=symbol_table.symbols.find(classname);
+  // Stub class?
+  if(findit_symbol==symbol_table.symbols.end())
+  {
+    warning() << "SKIPPED: " << classname << eom;
+    return false;
+  }
+  const symbolt &class_symbol=symbol_table.lookup(classname);
+  for(const auto &base : to_class_type(class_symbol.type).bases())
+  {
+    if(class_needs_clinit(to_symbol_type(base.type()).get_identifier()))
+    {
+      findit_any.first->second=true;
+      return true;
+    }
+  }
+  return false;
+}
+
+/*******************************************************************\
+
+Function: java_bytecode_convert_methodt::get_or_create_clinit_wrapper
+
+  Inputs: classname: Class name
+
+ Outputs: Returns a symbol_exprt pointing to the given class' clinit
+          wrapper if one is required, or nil otherwise.
+
+ Purpose: Create a ::clinit_wrapper the first time a static initializer
+          might be called. The wrapper method checks whether static init
+          has already taken place, calls the actual <clinit> method if
+          not, and initializes super-classes and interfaces.
+
+\*******************************************************************/
+
+exprt java_bytecode_convert_methodt::get_or_create_clinit_wrapper(
+  const irep_idt &classname)
+{
+  if(!class_needs_clinit(classname))
+    return static_cast<const exprt &>(get_nil_irep());
+
+  const irep_idt &clinit_wrapper_name=
+    id2string(classname)+"::clinit_wrapper";
+  auto findit=symbol_table.symbols.find(clinit_wrapper_name);
+  if(findit!=symbol_table.symbols.end())
+    return findit->second.symbol_expr();
+
+  // Create the wrapper now:
+  const irep_idt &already_run_name=
+    id2string(classname)+"::clinit_already_run";
+  symbolt already_run_symbol;
+  already_run_symbol.name=already_run_name;
+  already_run_symbol.pretty_name=already_run_name;
+  already_run_symbol.base_name="clinit_already_run";
+  already_run_symbol.type=bool_typet();
+  already_run_symbol.value=false_exprt();
+  already_run_symbol.is_lvalue=true;
+  already_run_symbol.is_state_var=true;
+  already_run_symbol.is_static_lifetime=true;
+  already_run_symbol.mode=ID_java;
+  symbol_table.add(already_run_symbol);
+
+  equal_exprt check_already_run(
+    already_run_symbol.symbol_expr(),
+    false_exprt());
+
+  code_ifthenelset wrapper_body;
+  wrapper_body.cond()=check_already_run;
+  code_blockt init_body;
+  // Note already-run is set *before* calling clinit, in order to prevent
+  // recursion in clinit methods.
+  code_assignt set_already_run(already_run_symbol.symbol_expr(), true_exprt());
+  init_body.move_to_operands(set_already_run);
+  const irep_idt &real_clinit_name=id2string(classname)+".<clinit>:()V";
+  const symbolt &class_symbol=symbol_table.lookup(classname);
+
+  auto findsymit=symbol_table.symbols.find(real_clinit_name);
+  if(findsymit!=symbol_table.symbols.end())
+  {
+    code_function_callt call_real_init;
+    call_real_init.function()=findsymit->second.symbol_expr();
+    init_body.move_to_operands(call_real_init);
+  }
+
+  for(const auto &base : to_class_type(class_symbol.type).bases())
+  {
+    const auto base_name=to_symbol_type(base.type()).get_identifier();
+    exprt base_init_routine=get_or_create_clinit_wrapper(base_name);
+    if(base_init_routine.is_nil())
+      continue;
+    code_function_callt call_base;
+    call_base.function()=base_init_routine;
+    init_body.move_to_operands(call_base);
+  }
+
+  wrapper_body.then_case()=init_body;
+
+  symbolt wrapper_method_symbol;
+  code_typet wrapper_method_type;
+  wrapper_method_type.return_type()=void_typet();
+  wrapper_method_symbol.name=clinit_wrapper_name;
+  wrapper_method_symbol.pretty_name=clinit_wrapper_name;
+  wrapper_method_symbol.base_name="clinit_wrapper";
+  wrapper_method_symbol.type=wrapper_method_type;
+  wrapper_method_symbol.value=wrapper_body;
+  wrapper_method_symbol.mode=ID_java;
+  symbol_table.add(wrapper_method_symbol);
+  return wrapper_method_symbol.symbol_expr();
+}
+
+/*******************************************************************\
+
+Function: java_bytecode_convert_methodt::get_clinit_call
+
+  Inputs: classname: Class name
+
+ Outputs: Returns a function call to the given class' static initializer
+          wrapper if one is needed, or a skip instruction otherwise.
+
+ Purpose: Each static access to classname should be prefixed with a check
+          for necessary static init; this returns a call implementing
+          that check.
+
+\*******************************************************************/
+
+codet java_bytecode_convert_methodt::get_clinit_call(
+  const irep_idt &classname)
+{
+  exprt callee=get_or_create_clinit_wrapper(classname);
+  if(callee.is_nil())
+    return code_skipt();
+  code_function_callt ret;
+  ret.function()=callee;
+  return ret;
 }
 
 /*******************************************************************\
@@ -900,6 +1140,26 @@ codet java_bytecode_convert_methodt::convert_instructions(
       instructionst::const_iterator next=i_it;
       if(++next!=instructions.end())
         a_entry.first->second.successors.push_back(next->address);
+    }
+
+    if(i_it->statement=="athrow" ||
+       i_it->statement=="invokestatic" ||
+       i_it->statement=="invokevirtual" ||
+       i_it->statement=="invokespecial" ||
+       i_it->statement=="invokeinterface")
+    {
+      // find the corresponding try-catch blocks and add the handlers
+      // to the targets
+      for(const auto &exception_row : method.exception_table)
+      {
+        if(i_it->address>=exception_row.start_pc &&
+           i_it->address<exception_row.end_pc)
+        {
+          a_entry.first->second.successors.push_back(
+            exception_row.handler_pc);
+          targets.insert(exception_row.handler_pc);
+        }
+      }
     }
 
     if(i_it->statement=="goto" ||
@@ -979,7 +1239,6 @@ codet java_bytecode_convert_methodt::convert_instructions(
   setup_local_variables(method, address_map);
 
   std::set<unsigned> working_set;
-  bool assertion_failure=false;
 
   if(!instructions.empty())
     working_set.insert(instructions.front().address);
@@ -989,6 +1248,7 @@ codet java_bytecode_convert_methodt::convert_instructions(
     std::set<unsigned>::iterator cur=working_set.begin();
     address_mapt::iterator a_it=address_map.find(*cur);
     assert(a_it!=address_map.end());
+    unsigned cur_pc=*cur;
     working_set.erase(cur);
 
     if(a_it->second.done)
@@ -1025,6 +1285,48 @@ codet java_bytecode_convert_methodt::convert_instructions(
       statement=std::string(id2string(statement), 0, statement.size()-2);
     }
 
+    // we throw away the first statement in an exception handler
+    // as we don't know if a function call had a normal or exceptional return
+    auto it=method.exception_table.begin();
+    for(; it!=method.exception_table.end(); ++it)
+    {
+      if(cur_pc==it->handler_pc)
+      {
+        exprt exc_var=variable(
+          arg0, statement[0],
+          i_it->address,
+          NO_CAST);
+
+        // throw away the operands
+        pop_residue(bytecode_info.pop);
+
+        // add a CATCH-PUSH signaling a handler
+        side_effect_expr_catcht catch_handler_expr;
+        // pack the exception variable so that it can be used
+        // later for instrumentation
+        catch_handler_expr.get_sub().resize(1);
+        catch_handler_expr.get_sub()[0]=exc_var;
+
+        code_expressiont catch_handler(catch_handler_expr);
+        code_labelt newlabel(label(std::to_string(cur_pc)),
+                             code_blockt());
+
+        code_blockt label_block=to_code_block(newlabel.code());
+        code_blockt handler_block;
+        handler_block.move_to_operands(c);
+        handler_block.move_to_operands(catch_handler);
+        handler_block.move_to_operands(label_block);
+        c=handler_block;
+        break;
+      }
+    }
+
+    if(it!=method.exception_table.end())
+    {
+      // go straight to the next statement
+      continue;
+    }
+
     exprt::operandst op=pop(bytecode_info.pop);
     exprt::operandst results;
     results.resize(bytecode_info.push, nil_exprt());
@@ -1037,39 +1339,51 @@ codet java_bytecode_convert_methodt::convert_instructions(
     else if(statement=="athrow")
     {
       assert(op.size()==1 && results.size()==1);
-      if(!assertion_failure)
-      {
-        side_effect_expr_throwt throw_expr;
-        throw_expr.add_source_location()=i_it->source_location;
-        throw_expr.copy_to_operands(op[0]);
-        c=code_expressiont(throw_expr);
-        results[0]=op[0];
-      }
-      else
-      {
-        // TODO: this can be removed once we properly handle throw
-        // if this athrow is generated by an assertion, then skip it
-        c=code_skipt();
-        assertion_failure=false;
-      }
+      code_blockt block;
+      // TODO throw NullPointerException instead
+      const typecast_exprt lhs(op[0], pointer_typet(empty_typet()));
+      const exprt rhs(null_pointer_exprt(to_pointer_type(lhs.type())));
+      const exprt not_equal_null(
+        binary_relation_exprt(lhs, ID_notequal, rhs));
+      code_assertt check(not_equal_null);
+      check.add_source_location()
+        .set_comment("Throw null");
+      check.add_source_location()
+        .set_property_class("null-pointer-exception");
+      block.move_to_operands(check);
+
+      side_effect_expr_throwt throw_expr;
+      throw_expr.add_source_location()=i_it->source_location;
+      throw_expr.copy_to_operands(op[0]);
+      c=code_expressiont(throw_expr);
+      results[0]=op[0];
+
+      block.move_to_operands(c);
+      c=block;
     }
     else if(statement=="checkcast")
     {
-      if(!disable_runtime_checks)
-      {
-        // checkcast throws an exception in case a cast of object
-        // on stack to given type fails.
-        // The stack isn't modified.
-        // TODO: convert assertions to exceptions.
-        assert(op.size()==1 && results.size()==1);
-        binary_predicate_exprt check(op[0], ID_java_instanceof, arg0);
-        c=code_assertt(check);
-        c.add_source_location().set_comment("Dynamic cast check");
-        c.add_source_location().set_property_class("bad-dynamic-cast");
-        results[0]=op[0];
-      }
-      else
-        c=code_skipt();
+      // checkcast throws an exception in case a cast of object
+      // on stack to given type fails.
+      // The stack isn't modified.
+      // TODO: convert assertions to exceptions.
+      assert(op.size()==1 && results.size()==1);
+      binary_predicate_exprt check(op[0], ID_java_instanceof, arg0);
+      code_assertt assert_class(check);
+      assert_class.add_source_location().set_comment("Dynamic cast check");
+      assert_class.add_source_location().set_property_class("bad-dynamic-cast");
+      // checkcast passes when the operand is null.
+      empty_typet voidt;
+      pointer_typet voidptr(voidt);
+      exprt null_check_op=op[0];
+      if(null_check_op.type()!=voidptr)
+        null_check_op.make_typecast(voidptr);
+      code_ifthenelset conditional_check;
+      notequal_exprt op_not_null(null_check_op, null_pointer_exprt(voidptr));
+      conditional_check.cond()=std::move(op_not_null);
+      conditional_check.then_case()=std::move(assert_class);
+      c=std::move(conditional_check);
+      results[0]=op[0];
     }
     else if(statement=="invokedynamic")
     {
@@ -1116,13 +1430,6 @@ codet java_bytecode_convert_methodt::convert_instructions(
             statement=="invokevirtual" ||
             statement=="invokestatic")
     {
-      // Remember that this is triggered by an assertion
-      if(statement=="invokespecial" &&
-         id2string(arg0.get(ID_identifier))
-         .find("AssertionError")!=std::string::npos)
-      {
-        assertion_failure=true;
-      }
       const bool use_this(statement!="invokestatic");
       const bool is_virtual(
         statement=="invokevirtual" || statement=="invokeinterface");
@@ -1216,9 +1523,18 @@ codet java_bytecode_convert_methodt::convert_instructions(
         symbolt symbol;
         symbol.name=id;
         symbol.base_name=arg0.get(ID_C_base_name);
+        symbol.pretty_name=
+          id2string(arg0.get(ID_C_class)).substr(6)+"."+
+          id2string(symbol.base_name)+"()";
         symbol.type=arg0.type();
         symbol.value.make_nil();
         symbol.mode=ID_java;
+
+        assign_parameter_names(
+          to_code_type(symbol.type),
+          symbol.name,
+          symbol_table);
+
         symbol_table.add(symbol);
       }
 
@@ -1241,6 +1557,18 @@ codet java_bytecode_convert_methodt::convert_instructions(
 
       call.function().add_source_location()=loc;
       c=call;
+
+      if(!use_this)
+      {
+        codet clinit_call=get_clinit_call(arg0.get(ID_C_class));
+        if(clinit_call.get_statement()!=ID_skip)
+        {
+          code_blockt ret_block;
+          ret_block.move_to_operands(clinit_call);
+          ret_block.move_to_operands(c);
+          c=std::move(ret_block);
+        }
+      }
     }
     else if(statement=="return")
     {
@@ -1278,13 +1606,10 @@ codet java_bytecode_convert_methodt::convert_instructions(
       const dereference_exprt element(data_plus_offset, element_type);
 
       c=code_blockt();
-      if(!disable_runtime_checks)
-      {
-        codet bounds_check=
-          get_array_bounds_check(deref, op[1], i_it->source_location);
-        bounds_check.add_source_location()=i_it->source_location;
-        c.move_to_operands(bounds_check);
-      }
+      codet bounds_check=
+        get_array_bounds_check(deref, op[1], i_it->source_location);
+      bounds_check.add_source_location()=i_it->source_location;
+      c.move_to_operands(bounds_check);
       code_assignt array_put(element, op[2]);
       array_put.add_source_location()=i_it->source_location;
       c.move_to_operands(array_put);
@@ -1324,11 +1649,8 @@ codet java_bytecode_convert_methodt::convert_instructions(
       typet element_type=data_ptr.type().subtype();
       dereference_exprt element(data_plus_offset, element_type);
 
-      if(!disable_runtime_checks)
-      {
-        c=get_array_bounds_check(deref, op[1], i_it->source_location);
-        c.add_source_location()=i_it->source_location;
-      }
+      c=get_array_bounds_check(deref, op[1], i_it->source_location);
+      c.add_source_location()=i_it->source_location;
       results[0]=java_bytecode_promotion(element);
     }
     else if(statement==patternt("?load"))
@@ -1785,9 +2107,14 @@ codet java_bytecode_convert_methodt::convert_instructions(
       }
       results[0]=java_bytecode_promotion(symbol_expr);
 
-      // set $assertionDisabled to false
-      if(field_name.find("$assertionsDisabled")!=std::string::npos)
+      codet clinit_call=get_clinit_call(arg0.get_string(ID_class));
+      if(clinit_call.get_statement()!=ID_skip)
+        c=clinit_call;
+      else if(field_name.find("$assertionsDisabled")!=std::string::npos)
+      {
+        // set $assertionDisabled to false
         c=code_assignt(symbol_expr, false_exprt());
+      }
     }
     else if(statement=="putfield")
     {
@@ -1806,6 +2133,14 @@ codet java_bytecode_convert_methodt::convert_instructions(
           to_symbol_type(arg0.type()).get_identifier());
       }
       c=code_assignt(symbol_expr, op[0]);
+      codet clinit_call=get_clinit_call(arg0.get_string(ID_class));
+      if(clinit_call.get_statement()!=ID_skip)
+      {
+        code_blockt ret_block;
+        ret_block.move_to_operands(clinit_call);
+        ret_block.move_to_operands(c);
+        c=std::move(ret_block);
+      }
     }
     else if(statement==patternt("?2?")) // i2c etc.
     {
@@ -1824,6 +2159,15 @@ codet java_bytecode_convert_methodt::convert_instructions(
 
       const exprt tmp=tmp_variable("new", ref_type);
       c=code_assignt(tmp, java_new_expr);
+      codet clinit_call=
+        get_clinit_call(to_symbol_type(arg0.type()).get_identifier());
+      if(clinit_call.get_statement()!=ID_skip)
+      {
+        code_blockt ret_block;
+        ret_block.move_to_operands(clinit_call);
+        ret_block.move_to_operands(c);
+        c=std::move(ret_block);
+      }
       results[0]=tmp;
     }
     else if(statement=="newarray" ||
@@ -1869,17 +2213,15 @@ codet java_bytecode_convert_methodt::convert_instructions(
         java_new_array.add_source_location()=i_it->source_location;
 
       c=code_blockt();
-      if(!disable_runtime_checks)
-      {
-        // TODO make this throw NegativeArrayIndexException instead.
-        constant_exprt intzero=from_integer(0, java_int_type());
-        binary_relation_exprt gezero(op[0], ID_ge, intzero);
-        code_assertt check(gezero);
-        check.add_source_location().set_comment("Array size < 0");
-        check.add_source_location()
-          .set_property_class("array-create-negative-size");
-        c.move_to_operands(check);
-      }
+      // TODO make this throw NegativeArrayIndexException instead.
+      constant_exprt intzero=from_integer(0, java_int_type());
+      binary_relation_exprt gezero(op[0], ID_ge, intzero);
+      code_assertt check(gezero);
+      check.add_source_location().set_comment("Array size < 0");
+      check.add_source_location()
+        .set_property_class("array-create-negative-size");
+      c.move_to_operands(check);
+
       if(max_array_length!=0)
       {
         constant_exprt size_limit=
@@ -1911,26 +2253,24 @@ codet java_bytecode_convert_methodt::convert_instructions(
         java_new_array.add_source_location()=i_it->source_location;
 
       code_blockt checkandcreate;
-      if(!disable_runtime_checks)
-      {
-        // TODO make this throw NegativeArrayIndexException instead.
-        constant_exprt intzero=from_integer(0, java_int_type());
-        binary_relation_exprt gezero(op[0], ID_ge, intzero);
-        code_assertt check(gezero);
-        check.add_source_location().set_comment("Array size < 0");
-        check.add_source_location()
-          .set_property_class("array-create-negative-size");
-        checkandcreate.move_to_operands(check);
+      // TODO make this throw NegativeArrayIndexException instead.
+      constant_exprt intzero=from_integer(0, java_int_type());
+      binary_relation_exprt gezero(op[0], ID_ge, intzero);
+      code_assertt check(gezero);
+      check.add_source_location().set_comment("Array size < 0");
+      check.add_source_location()
+        .set_property_class("array-create-negative-size");
+      checkandcreate.move_to_operands(check);
 
-        if(max_array_length!=0)
-        {
-          constant_exprt size_limit=
-            from_integer(max_array_length, java_int_type());
-          binary_relation_exprt le_max_size(op[0], ID_le, size_limit);
-          code_assumet assume_le_max_size(le_max_size);
-          checkandcreate.move_to_operands(assume_le_max_size);
-        }
+      if(max_array_length!=0)
+      {
+        constant_exprt size_limit=
+          from_integer(max_array_length, java_int_type());
+        binary_relation_exprt le_max_size(op[0], ID_le, size_limit);
+        code_assumet assume_le_max_size(le_max_size);
+        checkandcreate.move_to_operands(assume_le_max_size);
       }
+
       const exprt tmp=tmp_variable("newarray", ref_type);
       c=code_assignt(tmp, java_new_array);
       results[0]=tmp;
@@ -2047,6 +2387,115 @@ codet java_bytecode_convert_methodt::convert_instructions(
       c.operands()=op;
     }
 
+    // next we do the exception handling
+    std::vector<irep_idt> exception_ids;
+    std::vector<irep_idt> handler_labels;
+
+    // for each try-catch add a CATCH-PUSH instruction
+    // each CATCH-PUSH records a list of all the handler labels
+    // together with a list of all the exception ids
+
+    // be aware of different try-catch blocks with the same starting pc
+    std::size_t pos=0;
+    std::size_t end_pc=0;
+    while(pos<method.exception_table.size())
+    {
+      // check if this is the beginning of a try block
+      for(; pos<method.exception_table.size(); ++pos)
+      {
+        // unexplored try-catch?
+        if(cur_pc==method.exception_table[pos].start_pc && end_pc==0)
+        {
+          end_pc=method.exception_table[pos].end_pc;
+        }
+
+        // currently explored try-catch?
+        if(cur_pc==method.exception_table[pos].start_pc &&
+           method.exception_table[pos].end_pc==end_pc)
+        {
+          exception_ids.push_back(
+            method.exception_table[pos].catch_type.get_identifier());
+          // record the exception handler in the CATCH-PUSH
+          // instruction by generating a label corresponding to
+          // the handler's pc
+          handler_labels.push_back(
+            label(std::to_string(method.exception_table[pos].handler_pc)));
+        }
+        else
+          break;
+      }
+
+      // add the actual PUSH-CATCH instruction
+      if(!exception_ids.empty())
+      {
+        // add the exception ids
+        side_effect_expr_catcht catch_push_expr;
+        irept result(ID_exception_list);
+        result.get_sub().resize(exception_ids.size());
+        for(size_t i=0; i<exception_ids.size(); ++i)
+          result.get_sub()[i].id(exception_ids[i]);
+        catch_push_expr.set(ID_exception_list, result);
+
+        // add the labels corresponding to the handlers
+        irept labels(ID_label);
+        labels.get_sub().resize(handler_labels.size());
+        for(size_t i=0; i<handler_labels.size(); ++i)
+          labels.get_sub()[i].id(handler_labels[i]);
+        catch_push_expr.set(ID_label, labels);
+
+        code_blockt try_block;
+        code_expressiont catch_push(catch_push_expr);
+        try_block.move_to_operands(catch_push);
+        try_block.move_to_operands(c);
+        c=try_block;
+      }
+      else
+      {
+        // advance
+        ++pos;
+      }
+
+      // reset
+      end_pc=0;
+      exception_ids.clear();
+      handler_labels.clear();
+    }
+
+    // next add the CATCH-POP instructions
+    size_t start_pc=0;
+    // as the first try block may have start_pc 0, we
+    // must track it separately
+    bool first_handler=false;
+    // check if this is the end of a try block
+    for(const auto &exception_row : method.exception_table)
+    {
+      // add the CATCH-POP before the end of the try block
+      if(cur_pc<exception_row.end_pc &&
+         !working_set.empty() &&
+         *working_set.begin()==exception_row.end_pc)
+      {
+        // have we already added a CATCH-POP for the current try-catch?
+        // (each row corresponds to a handler)
+        if(exception_row.start_pc!=start_pc || !first_handler)
+        {
+          if(!first_handler)
+            first_handler=true;
+          // remember the beginning of the try-catch so that we don't add
+          // another CATCH-POP for the same try-catch
+          start_pc=exception_row.start_pc;
+          // add CATCH_POP instruction
+          side_effect_expr_catcht catch_pop_expr;
+          code_blockt end_try_block;
+          code_expressiont catch_pop(catch_pop_expr);
+          catch_pop.set(ID_exception_list, get_nil_irep());
+          catch_pop.set(ID_label, get_nil_irep());
+          end_try_block.move_to_operands(c);
+          end_try_block.move_to_operands(catch_pop);
+          c=end_try_block;
+        }
+      }
+    }
+
     if(!i_it->source_location.get_line().empty())
       c.add_source_location()=i_it->source_location;
 
@@ -2057,6 +2506,18 @@ codet java_bytecode_convert_methodt::convert_instructions(
     {
       address_mapt::iterator a_it2=address_map.find(address);
       assert(a_it2!=address_map.end());
+
+      // we don't worry about exception handlers as we don't load the
+      // operands from the stack anyway -- we keep explicit global
+      // exception variables
+      for(const auto &exception_row : method.exception_table)
+      {
+        if(address==exception_row.handler_pc)
+        {
+          stack.clear();
+          break;
+        }
+      }
 
       if(!stack.empty() && a_it2->second.predecessors.size()>1)
       {
@@ -2122,8 +2583,6 @@ codet java_bytecode_convert_methodt::convert_instructions(
     }
   }
 
-  // TODO: add exception handlers from exception table
-  // review successor computation of athrow!
   code_blockt code;
 
   // Add anonymous locals to the symtab:
@@ -2152,6 +2611,8 @@ codet java_bytecode_convert_methodt::convert_instructions(
   // First create a simple flat list of basic blocks. We'll add lexical nesting
   // constructs as variable live-ranges require next.
   bool start_new_block=true;
+  bool has_seen_previous_address=false;
+  unsigned previous_address=0;
   for(const auto &address_pair : address_map)
   {
     const unsigned address=address_pair.first;
@@ -2165,6 +2626,16 @@ codet java_bytecode_convert_methodt::convert_instructions(
     // (e.g. due to exceptional control flow)
     if(!start_new_block)
       start_new_block=address_pair.second.predecessors.size()>1;
+    // Start a new lexical block if we've just entered a try block
+    if(!start_new_block && has_seen_previous_address)
+    {
+      for(const auto &exception_row : method.exception_table)
+        if(exception_row.start_pc==previous_address)
+        {
+          start_new_block=true;
+          break;
+        }
+    }
 
     if(start_new_block)
     {
@@ -2184,6 +2655,9 @@ codet java_bytecode_convert_methodt::convert_instructions(
       add_to_block.add(c);
     }
     start_new_block=address_pair.second.successors.size()>1;
+
+    previous_address=address;
+    has_seen_previous_address=true;
   }
 
   // Find out where temporaries are used:
@@ -2266,15 +2740,36 @@ void java_bytecode_convert_method(
   const java_bytecode_parse_treet::methodt &method,
   symbol_tablet &symbol_table,
   message_handlert &message_handler,
-  bool disable_runtime_checks,
   size_t max_array_length,
   safe_pointer<std::vector<irep_idt> > needed_methods,
   safe_pointer<std::set<irep_idt> > needed_classes)
 {
+  static const std::unordered_set<std::string> methods_to_ignore
+  {
+    "nondetBoolean",
+    "nondetByte",
+    "nondetChar",
+    "nondetShort",
+    "nondetInt",
+    "nondetLong",
+    "nondetFloat",
+    "nondetDouble",
+    "nondetWithNull",
+    "nondetWithoutNull",
+  };
+
+  if(std::regex_match(
+       id2string(class_symbol.name),
+       std::regex(".*org\\.cprover\\.CProver.*")) &&
+     methods_to_ignore.find(id2string(method.name))!=methods_to_ignore.end())
+  {
+    // Ignore these methods, rely on default stubbing behaviour.
+    return;
+  }
+
   java_bytecode_convert_methodt java_bytecode_convert_method(
     symbol_table,
     message_handler,
-    disable_runtime_checks,
     max_array_length,
     needed_methods,
     needed_classes);

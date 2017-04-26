@@ -580,7 +580,7 @@ void goto_convertt::do_cpp_new(
     if(new_array)
       new_call.arguments().push_back(count);
     new_call.arguments().push_back(object_size);
-    new_call.set("#type", lhs.type().subtype());
+    new_call.set(ID_C_cxx_alloc_type, lhs.type().subtype());
     new_call.lhs()=tmp_symbol_expr;
     new_call.add_source_location()=rhs.source_location();
 
@@ -612,7 +612,7 @@ void goto_convertt::do_cpp_new(
       new_call.arguments().push_back(count);
     new_call.arguments().push_back(object_size);
     new_call.arguments().push_back(rhs.op0()); // memory location
-    new_call.set("#type", lhs.type().subtype());
+    new_call.set(ID_C_cxx_alloc_type, lhs.type().subtype());
     new_call.lhs()=tmp_symbol_expr;
     new_call.add_source_location()=rhs.source_location();
 
@@ -802,14 +802,21 @@ void goto_convertt::do_java_new_array(
   t_n->code=code_assignt(lhs, malloc_expr);
   t_n->source_location=location;
 
-  // multi-dimensional?
-
   assert(ns.follow(object_type).id()==ID_struct);
   const struct_typet &struct_type=to_struct_type(ns.follow(object_type));
   assert(struct_type.components().size()==3);
 
-  // if it's an array, we need to set the length field
+  // Init base class:
   dereference_exprt deref(lhs, object_type);
+  exprt zero_object=
+    zero_initializer(object_type, location, ns, get_message_handler());
+  set_class_identifier(
+    to_struct_expr(zero_object), ns, to_symbol_type(object_type));
+  goto_programt::targett t_i=dest.add_instruction(ASSIGN);
+  t_i->code=code_assignt(deref, zero_object);
+  t_i->source_location=location;
+
+  // if it's an array, we need to set the length field
   member_exprt length(
     deref,
     struct_type.components()[1].get_name(),
@@ -823,24 +830,60 @@ void goto_convertt::do_java_new_array(
     deref,
     struct_type.components()[2].get_name(),
     struct_type.components()[2].type());
-  side_effect_exprt data_cpp_new_expr(ID_cpp_new_array, data.type());
+
+  // Allocate a (struct realtype**) instead of a (void**) if possible.
+  const irept &given_element_type=object_type.find(ID_C_element_type);
+  typet allocate_data_type;
+  exprt cast_data_member;
+  if(given_element_type.is_not_nil())
+  {
+    allocate_data_type=
+      pointer_typet(static_cast<const typet &>(given_element_type));
+  }
+  else
+    allocate_data_type=data.type();
+
+  side_effect_exprt data_cpp_new_expr(ID_cpp_new_array, allocate_data_type);
   data_cpp_new_expr.set(ID_size, rhs.op0());
+
+  // Must directly assign the new array to a temporary
+  // because goto-symex will notice `x=side_effect_exprt` but not
+  // `x=typecast_exprt(side_effect_exprt(...))`
+  symbol_exprt new_array_data_symbol=
+    new_tmp_symbol(
+      data_cpp_new_expr.type(),
+      "new_array_data",
+      dest,
+      location)
+    .symbol_expr();
+  goto_programt::targett t_p2=dest.add_instruction(ASSIGN);
+  t_p2->code=code_assignt(new_array_data_symbol, data_cpp_new_expr);
+  t_p2->source_location=location;
+
   goto_programt::targett t_p=dest.add_instruction(ASSIGN);
-  t_p->code=code_assignt(data, data_cpp_new_expr);
+  exprt cast_cpp_new=new_array_data_symbol;
+  if(cast_cpp_new.type()!=data.type())
+    cast_cpp_new=typecast_exprt(cast_cpp_new, data.type());
+  t_p->code=code_assignt(data, cast_cpp_new);
   t_p->source_location=location;
 
   // zero-initialize the data
-  exprt zero_element=
-    zero_initializer(
-      data.type().subtype(),
-      location,
-      ns,
-      get_message_handler());
-  codet array_set(ID_array_set);
-  array_set.copy_to_operands(data, zero_element);
-  goto_programt::targett t_d=dest.add_instruction(OTHER);
-  t_d->code=array_set;
-  t_d->source_location=location;
+  if(!rhs.get_bool(ID_skip_initialize))
+  {
+    exprt zero_element=
+      zero_initializer(
+        data.type().subtype(),
+        location,
+        ns,
+        get_message_handler());
+    codet array_set(ID_array_set);
+    array_set.copy_to_operands(new_array_data_symbol, zero_element);
+    goto_programt::targett t_d=dest.add_instruction(OTHER);
+    t_d->code=array_set;
+    t_d->source_location=location;
+  }
+
+  // multi-dimensional?
 
   if(rhs.operands().size()>=2)
   {
@@ -851,12 +894,18 @@ void goto_convertt::do_java_new_array(
     goto_programt tmp;
 
     symbol_exprt tmp_i=
-      new_tmp_symbol(index_type(), "index", tmp, location).symbol_expr();
+      new_tmp_symbol(length.type(), "index", tmp, location).symbol_expr();
 
     code_fort for_loop;
 
     side_effect_exprt sub_java_new=rhs;
     sub_java_new.operands().erase(sub_java_new.operands().begin());
+
+    assert(rhs.type().id()==ID_pointer);
+    typet sub_type=
+      static_cast<const typet &>(rhs.type().subtype().find("#element_type"));
+    assert(sub_type.id()==ID_pointer);
+    sub_java_new.type()=sub_type;
 
     side_effect_exprt inc(ID_assign);
     inc.operands().resize(2);
@@ -866,11 +915,21 @@ void goto_convertt::do_java_new_array(
     dereference_exprt deref_expr(
       plus_exprt(data, tmp_i), data.type().subtype());
 
+    code_blockt for_body;
+    symbol_exprt init_sym=
+      new_tmp_symbol(sub_type, "subarray_init", tmp, location).symbol_expr();
+
+    code_assignt init_subarray(init_sym, sub_java_new);
+    code_assignt assign_subarray(
+      deref_expr,
+      typecast_exprt(init_sym, deref_expr.type()));
+    for_body.move_to_operands(init_subarray);
+    for_body.move_to_operands(assign_subarray);
+
     for_loop.init()=code_assignt(tmp_i, from_integer(0, tmp_i.type()));
     for_loop.cond()=binary_relation_exprt(tmp_i, ID_lt, rhs.op0());
     for_loop.iter()=inc;
-    for_loop.body()=code_skipt();
-    for_loop.body()=code_assignt(deref_expr, sub_java_new);
+    for_loop.body()=for_body;
 
     convert(for_loop, tmp);
     dest.destructive_append(tmp);
@@ -1229,6 +1288,13 @@ void goto_convertt::do_function_call_symbol(
       error() << identifier << " expected not to have LHS" << eom;
       throw 0;
     }
+
+    // __VERIFIER_error has abort() semantics, even if no assertions
+    // are being checked
+    goto_programt::targett a=dest.add_instruction(ASSUME);
+    a->guard=false_exprt();
+    a->source_location=function.source_location();
+    a->source_location.set("user-provided", true);
   }
   else if(has_prefix(
       id2string(identifier), "java::java.lang.AssertionError.<init>:"))
@@ -1304,7 +1370,9 @@ void goto_convertt::do_function_call_symbol(
     goto_programt::targett t=dest.add_instruction(ASSERT);
     t->guard=arguments[0];
     t->source_location=function.source_location();
-    t->source_location.set("user-provided", true);
+    t->source_location.set(
+      "user-provided",
+      !function.source_location().is_built_in());
     t->source_location.set_property_class(ID_assertion);
     t->source_location.set_comment(description);
 

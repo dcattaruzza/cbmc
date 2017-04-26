@@ -232,6 +232,11 @@ std::string expr2ct::convert_rec(
   std::string d=
     declarator==""?declarator:" "+declarator;
 
+  if(src.find(ID_C_typedef).is_not_nil())
+  {
+    return q+id2string(src.get(ID_C_typedef))+d;
+  }
+
   if(src.id()==ID_bool)
   {
     return q+"_Bool"+d;
@@ -518,28 +523,40 @@ std::string expr2ct::convert_rec(
   }
   else if(src.id()==ID_symbol)
   {
-    const typet &followed=ns.follow(src);
+    symbol_typet symbolic_type=to_symbol_type(src);
+    const irep_idt &typedef_identifer=symbolic_type.get(ID_typedef);
 
-    if(followed.id()==ID_struct)
+    // Providing we have a valid identifer, we can just use that rather than
+    // trying to find the concrete type
+    if(typedef_identifer!="")
     {
-      std::string dest=q+"struct";
-      const irep_idt &tag=to_struct_type(followed).get_tag();
-      if(tag!="")
-        dest+=" "+id2string(tag);
-      dest+=d;
-      return dest;
-    }
-    else if(followed.id()==ID_union)
-    {
-      std::string dest=q+"union";
-      const irep_idt &tag=to_union_type(followed).get_tag();
-      if(tag!="")
-        dest+=" "+id2string(tag);
-      dest+=d;
-      return dest;
+      return q+id2string(typedef_identifer)+d;
     }
     else
-      return convert_rec(followed, new_qualifiers, declarator);
+    {
+      const typet &followed=ns.follow(src);
+
+      if(followed.id()==ID_struct)
+      {
+        std::string dest=q+"struct";
+        const irep_idt &tag=to_struct_type(followed).get_tag();
+        if(tag!="")
+          dest+=" "+id2string(tag);
+        dest+=d;
+        return dest;
+      }
+      else if(followed.id()==ID_union)
+      {
+        std::string dest=q+"union";
+        const irep_idt &tag=to_union_type(followed).get_tag();
+        if(tag!="")
+          dest+=" "+id2string(tag);
+        dest+=d;
+        return dest;
+      }
+      else
+        return convert_rec(followed, new_qualifiers, declarator);
+    }
   }
   else if(src.id()==ID_struct_tag)
   {
@@ -3337,7 +3354,7 @@ std::string expr2ct::convert_code_return(
   std::string dest=indent_str(indent);
   dest+="return";
 
-  if(src.operands().size()==1)
+  if(to_code_return(src).has_return_value())
     dest+=" "+convert(src.op0());
 
   dest+=';';
