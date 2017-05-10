@@ -84,7 +84,7 @@ void interpretert::initialize(bool init)
     main_it=goto_functions.function_map.find(goto_functionst::entry_point());
 
   if(main_it==goto_functions.function_map.end())
-    throw "main not found";
+    throw as_string(goto_functionst::entry_point())+" not found";
 
   const goto_functionst::goto_functiont &goto_function=main_it->second;
 
