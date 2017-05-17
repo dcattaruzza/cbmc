@@ -110,7 +110,7 @@ protected:
 
   friend class bmc_all_propertiest;
   friend class bmc_covert;
-  template <template <class goalt> class covert>
+  template <template <class goalt> class covert, class goalt>
   friend class bmc_goal_covert;
   friend class fault_localizationt;
 };
